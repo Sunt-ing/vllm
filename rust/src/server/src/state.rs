@@ -25,6 +25,8 @@ pub struct AppState {
     pub enable_log_requests: bool,
     /// Whether to set X-Request-Id on every HTTP response.
     pub enable_request_id_headers: bool,
+    /// Engine `--max-logprobs` cap used to reject over-limit logprobs requests.
+    pub max_logprobs: Option<i32>,
     /// Runtime server information returned by `/server_info`, when available.
     server_info: Option<ServerInfoSnapshot>,
     /// Number of in-flight inference requests currently owned by this frontend.
@@ -52,6 +54,7 @@ impl AppState {
             chat,
             enable_log_requests: false,
             enable_request_id_headers: false,
+            max_logprobs: None,
             server_info: None,
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
@@ -65,6 +68,11 @@ impl AppState {
     }
 
     /// Enable X-Request-Id response headers.
+    pub fn with_max_logprobs(mut self, max_logprobs: Option<i32>) -> Self {
+        self.max_logprobs = max_logprobs;
+        self
+    }
+
     pub fn with_request_id_headers(mut self, enabled: bool) -> Self {
         self.enable_request_id_headers = enabled;
         self

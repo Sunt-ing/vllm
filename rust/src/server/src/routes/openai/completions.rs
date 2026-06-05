@@ -43,7 +43,8 @@ pub async fn completions(
 ) -> Response {
     let stream = body.stream;
     let logprobs = body.logprobs;
-    let request_context = resolve_request_context(&headers, body.request_id.as_deref());
+    let mut request_context = resolve_request_context(&headers, body.request_id.as_deref());
+    request_context.max_logprobs = state.max_logprobs;
     let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
 
     let prepared = match prepare_completion_request(body, &lora_resolution, request_context) {

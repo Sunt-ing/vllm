@@ -70,6 +70,9 @@ pub struct Config {
     /// When `true`, suppress periodic stats logging (throughput, queue depth,
     /// cache usage).
     pub disable_log_stats: bool,
+    /// Maximum number of logprobs returnable per token, mirroring the engine's
+    /// `--max-logprobs`. `None` uses the default cap; -1 means no cap.
+    pub max_logprobs: Option<i32>,
     /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,

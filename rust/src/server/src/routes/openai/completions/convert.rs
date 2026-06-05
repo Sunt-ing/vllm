@@ -38,7 +38,7 @@ pub(crate) fn prepare_completion_request(
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
 ) -> Result<PreparedRequest, ApiError> {
-    validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+    validate::validate_request_compat(&request, &lora_resolution.model_names, ctx.max_logprobs)?;
 
     let request_id = format!("cmpl-{}", ctx.request_id);
     let response_model = lora_resolution

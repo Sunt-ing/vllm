@@ -12,6 +12,8 @@ use crate::error::ApiError;
 pub struct ResolvedRequestContext {
     pub request_id: String,
     pub data_parallel_rank: Option<u32>,
+    /// Engine `--max-logprobs` cap, threaded in by the handler from app state.
+    pub max_logprobs: Option<i32>,
 }
 
 /// Return the current Unix timestamp in seconds for OpenAI response objects.
@@ -89,6 +91,7 @@ pub fn resolve_request_context(
     ResolvedRequestContext {
         request_id,
         data_parallel_rank,
+        max_logprobs: None,
     }
 }
 

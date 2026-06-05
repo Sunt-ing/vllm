@@ -125,6 +125,10 @@ pub struct SharedRuntimeArgs {
     /// `config.json`.
     #[arg(long)]
     pub max_model_len: Option<u32>,
+    /// Maximum number of logprobs returnable per token (mirrors the engine's
+    /// `--max-logprobs`, default 20; -1 means no cap).
+    #[arg(long)]
+    pub max_logprobs: Option<i32>,
     /// TCP port for the gRPC Generate service. When not set, no gRPC server is
     /// started.
     #[arg(long)]
@@ -254,6 +258,7 @@ impl SharedRuntimeArgs {
             enable_log_requests: self.enable_log_requests,
             enable_request_id_headers: self.enable_request_id_headers,
             disable_log_stats: self.disable_log_stats,
+            max_logprobs: self.max_logprobs,
             grpc_port: self.grpc_port,
             shutdown_timeout,
         }
@@ -296,6 +301,7 @@ impl SharedRuntimeArgs {
             enable_log_requests: self.enable_log_requests,
             enable_request_id_headers: self.enable_request_id_headers,
             disable_log_stats: self.disable_log_stats,
+            max_logprobs: self.max_logprobs,
             grpc_port: self.grpc_port,
             shutdown_timeout,
         }

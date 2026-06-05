@@ -7,6 +7,7 @@ use crate::error::{ApiError, bail_invalid_request};
 pub(super) fn validate_request_compat(
     request: &CompletionRequest,
     served_model_names: &[String],
+    max_logprobs: Option<i32>,
 ) -> Result<(), ApiError> {
     // This path is intentionally scoped to the minimum surface needed by
     // `vllm-bench` random workload compatibility, so unsupported legacy
@@ -62,6 +63,28 @@ pub(super) fn validate_request_compat(
             bail_invalid_request!(
                 param = "prompt_logprobs",
                 "`prompt_logprobs` must be a non-negative value or -1."
+            );
+        }
+    }
+
+    // Reject logprobs counts above the engine's max_logprobs cap; unchecked they
+    // reach EngineCore and abort it. None uses the default (20); -1 means no cap.
+    let max_logprobs = max_logprobs.unwrap_or(20);
+    if max_logprobs >= 0 {
+        if let Some(logprobs) = request.logprobs
+            && i64::from(logprobs) > i64::from(max_logprobs)
+        {
+            bail_invalid_request!(
+                param = "logprobs",
+                "logprobs ({logprobs}) is greater than max allowed: {max_logprobs}."
+            );
+        }
+        if let Some(prompt_logprobs) = request.prompt_logprobs
+            && prompt_logprobs > max_logprobs
+        {
+            bail_invalid_request!(
+                param = "prompt_logprobs",
+                "prompt_logprobs ({prompt_logprobs}) is greater than max allowed: {max_logprobs}."
             );
         }
     }
@@ -131,7 +154,8 @@ mod tests {
             ..base_request()
         };
         assert!(
-            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"]), None)
+                .is_ok()
         );
     }
 
@@ -141,7 +165,8 @@ mod tests {
         assert!(
             validate_request_compat(
                 &request,
-                &served_names(&["other-alias", "Qwen/Qwen1.5-0.5B-Chat"])
+                &served_names(&["other-alias", "Qwen/Qwen1.5-0.5B-Chat"]),
+                None
             )
             .is_ok()
         );
@@ -150,7 +175,7 @@ mod tests {
     #[test]
     fn validate_request_compat_rejects_unknown_model() {
         let request = base_request();
-        assert!(validate_request_compat(&request, &served_names(&["other-model"])).is_err());
+        assert!(validate_request_compat(&request, &served_names(&["other-model"]), None).is_err());
     }
 
     #[test]
@@ -160,8 +185,53 @@ mod tests {
             ..base_request()
         };
         assert!(
-            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err()
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"]), None)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_logprobs_over_max() {
+        let request = CompletionRequest {
+            logprobs: Some(50),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(
+                &request,
+                &served_names(&["Qwen/Qwen1.5-0.5B-Chat"]),
+                Some(20)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_logprobs_within_max() {
+        let request = CompletionRequest {
+            logprobs: Some(5),
+            ..base_request()
+        };
+        validate_request_compat(
+            &request,
+            &served_names(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            Some(20),
+        )
+        .expect("logprobs within max should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_allows_logprobs_when_max_is_negative() {
+        let request = CompletionRequest {
+            logprobs: Some(1000),
+            ..base_request()
+        };
+        validate_request_compat(
+            &request,
+            &served_names(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            Some(-1),
+        )
+        .expect("-1 means no logprobs cap");
     }
 
     #[test]
@@ -172,7 +242,8 @@ mod tests {
             ..base_request()
         };
         assert!(
-            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"]), None)
+                .is_ok()
         );
     }
 }

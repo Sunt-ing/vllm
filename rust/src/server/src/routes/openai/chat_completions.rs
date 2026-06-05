@@ -48,7 +48,8 @@ pub async fn chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let stream = body.stream;
-    let request_context = resolve_request_context(&headers, body.request_id.as_deref());
+    let mut request_context = resolve_request_context(&headers, body.request_id.as_deref());
+    request_context.max_logprobs = state.max_logprobs;
     let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
 
     let prepared = match prepare_chat_request(body, &lora_resolution, request_context) {
