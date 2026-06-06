@@ -81,11 +81,15 @@ def with_cancellation(handler_func):
         handler_task = asyncio.create_task(handler_func(*args, **kwargs))
         cancellation_task = asyncio.create_task(listen_for_disconnect(request))
 
-        done, pending = await asyncio.wait(
-            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
+        try:
+            done, _ = await asyncio.wait(
+                [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            # Cancel both child tasks on any exit (including an outer
+            # cancellation of this wrapper) so they are never leaked.
+            handler_task.cancel()
+            cancellation_task.cancel()
 
         if handler_task in done:
             return handler_task.result()

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+
 import pytest
 
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
@@ -8,6 +10,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
     get_max_tokens,
     sanitize_message,
     should_include_usage,
+    with_cancellation,
 )
 
 
@@ -118,3 +121,62 @@ class TestGetMaxTokens:
                 input_length=150,
                 default_sampling_params={"max_tokens": 2048},
             )
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_outer_cancel_propagates_to_children():
+    # An outer cancellation of the wrapper (server shutdown / timeout) must
+    # cancel both child tasks, not leak them.
+    handler_cancelled = False
+    listener_cancelled = False
+
+    async def handler(request, raw_request):
+        nonlocal handler_cancelled
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            handler_cancelled = True
+            raise
+
+    class _Req:
+        async def receive(self):
+            nonlocal listener_cancelled
+            try:
+                await asyncio.Event().wait()  # never disconnects
+            except asyncio.CancelledError:
+                listener_cancelled = True
+                raise
+
+    task = asyncio.create_task(with_cancellation(handler)(None, _Req()))
+    await asyncio.sleep(0.05)  # let the child tasks start and enter the wait
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)  # let the child cancellations settle
+
+    assert handler_cancelled
+    assert listener_cancelled
+
+
+@pytest.mark.asyncio
+async def test_with_cancellation_disconnect_returns_none_and_cancels_handler():
+    # Normal client-disconnect path still cancels the handler and returns None.
+    handler_cancelled = False
+
+    async def handler(request, raw_request):
+        nonlocal handler_cancelled
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            handler_cancelled = True
+            raise
+
+    class _Req:
+        async def receive(self):
+            return {"type": "http.disconnect"}
+
+    result = await with_cancellation(handler)(None, _Req())
+    await asyncio.sleep(0.05)
+
+    assert result is None
+    assert handler_cancelled
