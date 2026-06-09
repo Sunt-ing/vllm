@@ -17,6 +17,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post};
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::middleware;
@@ -125,7 +126,9 @@ fn build_router_with_options(
         router = router.layer(from_fn(middleware::set_request_id_header));
     }
 
-    router
+    // Outermost layer: a panic in any handler returns HTTP 500 for that one
+    // request instead of aborting the whole frontend process.
+    router.layer(CatchPanicLayer::new())
 }
 
 #[cfg(test)]
