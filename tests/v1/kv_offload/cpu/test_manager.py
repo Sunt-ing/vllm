@@ -641,6 +641,42 @@ class TestARCPolicy:
         events = list(cpu_manager.take_events())
         assert len(events) > 0  # should have store and eviction events
 
+    def test_evict_falls_back_to_t1_when_t2_empty(self):
+        """
+        Regression test: once target_t1_size is driven above the number of T1
+        blocks an eviction may still take while T2 is empty, eviction must fall
+        back to T1 rather than report that the request cannot be satisfied.
+        Otherwise prepare_store() returns None and the whole offload batch is
+        silently dropped even though T1 holds enough evictable blocks.
+        """
+        cpu_manager, arc_policy = self._make_manager(num_blocks=4)
+
+        # fill T1, then offload more so blocks 1, 2, 3 are evicted into B1
+        cpu_manager.prepare_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+        cpu_manager.prepare_store(to_keys([5, 6, 7]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([5, 6, 7]), _EMPTY_REQ_CTX)
+
+        # T1 = {4, 5, 6, 7}, T2 empty, B1 = {1, 2, 3}
+        assert len(arc_policy.t2) == 0
+        assert {to_key(i) for i in (1, 2, 3)} <= set(arc_policy.b1)
+
+        # re-request the evicted prefixes: B1 hits raise target_t1_size to 3
+        cpu_manager.touch(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+        assert arc_policy.target_t1_size == 3
+        assert len(arc_policy.t2) == 0
+
+        # offloading 3 more needs 3 evictions; T1 still has 4 evictable blocks,
+        # so the request is satisfiable and must not return None
+        output = cpu_manager.prepare_store(to_keys([8, 9, 10]), _EMPTY_REQ_CTX)
+        assert output is not None
+        assert len(output.evicted_keys) == 3
+        # all evictions came from T1, since T2 was empty
+        assert set(output.evicted_keys) <= {to_key(i) for i in (4, 5, 6, 7)}
+
+        cpu_manager.complete_store(to_keys([8, 9, 10]), _EMPTY_REQ_CTX)
+        assert cpu_manager.lookup(to_key(8), _EMPTY_REQ_CTX) is True
+
 
 def test_filter_reused_manager():
     """

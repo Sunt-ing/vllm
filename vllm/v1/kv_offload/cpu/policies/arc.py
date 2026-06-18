@@ -124,31 +124,32 @@ class ARCCachePolicy(CachePolicy):
         virtual_t1_size = len(self.t1)
 
         for _ in range(n):
-            candidate: tuple[OffloadKey, BlockStatus, bool] | None = None
-
+            # Evict from T1 while it is at/above its adaptive target, else from
+            # T2; fall back to the other list when the preferred one has no
+            # eligible block, so failure is reported only if neither can.
             if virtual_t1_size >= int(self.target_t1_size):
-                for key, block in self.t1.items():
+                sources = ((self.t1, True), (self.t2, False))
+            else:
+                sources = ((self.t2, False), (self.t1, True))
+
+            candidate: tuple[OffloadKey, BlockStatus, bool] | None = None
+            for source, from_t1 in sources:
+                for key, block in source.items():
                     if (
                         block.ref_cnt == 0
                         and key not in protected
                         and key not in already_selected
                     ):
-                        candidate = (key, block, True)
-                        virtual_t1_size -= 1
+                        candidate = (key, block, from_t1)
                         break
+                if candidate is not None:
+                    break
 
             if candidate is None:
-                for key, block in self.t2.items():
-                    if (
-                        block.ref_cnt == 0
-                        and key not in protected
-                        and key not in already_selected
-                    ):
-                        candidate = (key, block, False)
-                        break
-                if candidate is None:
-                    return None
+                return None
 
+            if candidate[2]:  # selected from T1
+                virtual_t1_size -= 1
             candidates.append(candidate)
             already_selected.add(candidate[0])
 
