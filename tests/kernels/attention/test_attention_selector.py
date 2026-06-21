@@ -546,3 +546,47 @@ def test_flash_attn_accepts_handled_fp8_variants(
 
     monkeypatch.setattr(fa_mod.current_platform, "is_xpu", lambda: True)
     assert FlashAttentionBackend.supports_kv_cache_dtype(kv_cache_dtype)
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype, builds_query_quant",
+    [
+        ("fp8_e4m3", True),
+        ("fp8_e5m2", False),
+    ],
+)
+def test_triton_attn_query_quant_matches_forward_assert(
+    kv_cache_dtype: str, builds_query_quant: bool
+):
+    """Attention must only build query_quant for kv_cache dtypes that its
+    forward() query-quant path handles ({fp8, fp8_e4m3, nvfp4}). TRITON_ATTN
+    advertises fp8_e5m2, so without the gate the layer builds query_quant and
+    forward() crashes engine warmup with a bare AssertionError."""
+    if CudaPlatform is None:
+        pytest.skip("CudaPlatform not available")
+    from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+    cache_config = CacheConfig(block_size=16, cache_dtype=kv_cache_dtype)
+    vllm_config = VllmConfig(
+        attention_config=AttentionConfig(), cache_config=cache_config
+    )
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(
+            "vllm.model_executor.layers.attention.attention.current_platform",
+            CudaPlatform(),
+        ),
+    ):
+        attn = Attention(
+            num_heads=8,
+            head_size=128,
+            scale=1.0,
+            num_kv_heads=8,
+            cache_config=cache_config,
+            prefix="test.attn",
+            attn_backend=TritonAttentionBackend,
+        )
+
+    assert attn.impl.supports_quant_query_input
+    assert (attn.query_quant is not None) == builds_query_quant
