@@ -1319,6 +1319,35 @@ def _model_output(scheduler, output, sampled):
     )
 
 
+def test_spec_decode_skipped_for_mamba_generated_logprobs():
+    scheduler = object.__new__(Scheduler)
+    scheduler.has_mamba_layers = True
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+
+    plain_req = create_requests(num_requests=1, num_tokens=1, req_ids=["plain"])[0]
+    prompt_logprobs_req = create_requests(
+        num_requests=1, num_tokens=1, prompt_logprobs=2, req_ids=["prompt"]
+    )[0]
+    logprobs_req = create_requests(num_requests=1, num_tokens=1, req_ids=["logprobs"])[
+        0
+    ]
+    logprobs_req.sampling_params.logprobs = 2
+    requests = [plain_req, prompt_logprobs_req, logprobs_req]
+    scheduler.requests = {request.request_id: request for request in requests}
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            [request.request_id for request in requests],
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        )
+    )
+
+    assert plain_req.spec_token_ids == [1, 2, 3]
+    assert prompt_logprobs_req.spec_token_ids == [4, 5, 6]
+    assert logprobs_req.spec_token_ids == []
+
+
 def test_spec_decode_padding_first_decode_step():
     """A request taking its first decode step (whole prompt already computed via
     a prefix-cache hit) is padded with placeholder (-1) spec tokens so it enters

@@ -815,6 +815,7 @@ class Scheduler(SchedulerInterface):
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
+                        and not self._disable_spec_decode_for_request(request)
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
                         if (
@@ -1943,6 +1944,14 @@ class Scheduler(SchedulerInterface):
                 # rejection or drafter gather can reference it.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    def _disable_spec_decode_for_request(self, request: Request) -> bool:
+        sampling_params = request.sampling_params
+        return (
+            self.has_mamba_layers
+            and sampling_params is not None
+            and sampling_params.num_logprobs is not None
+        )
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
@@ -1957,6 +1966,10 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                continue
+
+            if self._disable_spec_decode_for_request(request):
+                request.spec_token_ids = []
                 continue
 
             # Add newly generated spec token ids to the request.

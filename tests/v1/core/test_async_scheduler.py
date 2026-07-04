@@ -30,6 +30,50 @@ def _make_model_runner_output(
     )
 
 
+def _make_async_scheduler_for_spec_decode(num_spec: int) -> AsyncScheduler:
+    scheduler = object.__new__(AsyncScheduler)
+    scheduler.requests = {}
+    scheduler.defer_block_free = False
+    scheduler.sched_step_seq = 0
+    scheduler._inflight_prefills = set()
+    scheduler.enable_return_routed_experts = False
+    scheduler.finished_req_ids = set()
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.num_spec_tokens = num_spec
+    scheduler._spec_token_placeholders = [-1] * num_spec
+    scheduler.use_v2_model_runner = False
+    scheduler.pp_size = 1
+    scheduler.has_mamba_layers = True
+    return scheduler
+
+
+def test_async_spec_decode_placeholders_skipped_for_mamba_logprobs():
+    num_spec = 3
+    scheduler = _make_async_scheduler_for_spec_decode(num_spec)
+
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    request.sampling_params.logprobs = 2
+    scheduler.requests = {request.request_id: request}
+
+    output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={request.request_id: [-1] * num_spec},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        num_spec_tokens_to_schedule=num_spec,
+    )
+
+    scheduler._update_after_schedule(output)
+
+    assert request.spec_token_ids == []
+    assert request.num_output_placeholders == 1
+
+
 @pytest.mark.parametrize("max_tokens", [1, 2, 3, 5])
 def test_stop_by_max_tokens(max_tokens: int):
     scheduler = create_scheduler(async_scheduling=True)
