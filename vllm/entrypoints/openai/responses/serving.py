@@ -1259,9 +1259,21 @@ class OpenAIServingResponses(GenerateBaseServing):
             while current_index < len(event_deque):
                 event = event_deque[current_index]
                 yield event
+                current_index += 1
                 if getattr(event, "type", "unknown") == "response.completed":
                     return
-                current_index += 1
+
+            if (
+                event_deque
+                and getattr(event_deque[-1], "type", "unknown")
+                == "response.completed"
+            ):
+                return
+
+            async with self.response_store_lock:
+                response = self.response_store.get(response_id)
+            if response is not None and response.status in ("cancelled", "failed"):
+                return
 
             await new_event_signal.wait()
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+from collections import deque
 from contextlib import AsyncExitStack
 from unittest.mock import MagicMock
 
@@ -35,6 +37,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.responses.context import ConversationContext, SimpleContext
 from vllm.entrypoints.openai.responses.protocol import (
+    ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseRawMessageAndToken,
     ResponsesRequest,
@@ -203,6 +206,104 @@ def test_response_created_event_uses_public_json_schema_alias() -> None:
     assert event.response.text is not None
     assert event.response.text.format is not None
     assert event.response.text.format.model_dump(by_alias=True)["schema"] == schema
+
+
+@pytest.mark.asyncio
+async def test_background_stream_generator_stops_after_completed_tail() -> None:
+    serving = object.__new__(OpenAIServingResponses)
+    response_id = "resp_tail"
+
+    request = ResponsesRequest(
+        request_id=response_id,
+        model="test-model",
+        input="hello",
+    )
+    sampling_params = SamplingParams(max_tokens=1)
+    created_response = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=sampling_params,
+        model_name="test-model",
+        created_time=0,
+        output=[],
+        status="in_progress",
+        usage=None,
+    )
+    completed_response = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=sampling_params,
+        model_name="test-model",
+        created_time=0,
+        output=[],
+        status="completed",
+        usage=None,
+    )
+
+    event_deque = deque(
+        [
+            ResponseCreatedEvent(
+                type="response.created",
+                sequence_number=0,
+                response=created_response,
+            ),
+            ResponseCompletedEvent(
+                type="response.completed",
+                sequence_number=1,
+                response=completed_response,
+            ),
+        ]
+    )
+    serving.event_store = {response_id: (event_deque, asyncio.Event())}
+
+    async def collect(starting_after: int):
+        return [
+            event
+            async for event in serving.responses_background_stream_generator(
+                response_id, starting_after
+            )
+        ]
+
+    replay = await asyncio.wait_for(collect(0), timeout=0.1)
+    assert [event.type for event in replay] == ["response.completed"]
+
+    tail = await asyncio.wait_for(collect(1), timeout=0.1)
+    assert tail == []
+
+
+@pytest.mark.asyncio
+async def test_background_stream_generator_stops_after_cancelled_status() -> None:
+    serving = object.__new__(OpenAIServingResponses)
+    response_id = "resp_cancel"
+
+    request = ResponsesRequest(
+        request_id=response_id,
+        model="test-model",
+        input="hello",
+    )
+    sampling_params = SamplingParams(max_tokens=1)
+    cancelled_response = ResponsesResponse.from_request(
+        request=request,
+        sampling_params=sampling_params,
+        model_name="test-model",
+        created_time=0,
+        output=[],
+        status="cancelled",
+        usage=None,
+    )
+
+    serving.event_store = {response_id: (deque(), asyncio.Event())}
+    serving.response_store = {response_id: cancelled_response}
+    serving.response_store_lock = asyncio.Lock()
+
+    async def collect():
+        return [
+            event
+            async for event in serving.responses_background_stream_generator(
+                response_id
+            )
+        ]
+
+    events = await asyncio.wait_for(collect(), timeout=0.1)
+    assert events == []
 
 
 class TestInitializeToolSessions:
