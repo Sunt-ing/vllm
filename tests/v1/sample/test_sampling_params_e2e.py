@@ -172,6 +172,30 @@ def test_allowed_token_ids(llm):
     with pytest.raises(ValueError):
         _ = llm.generate(PROMPT, SamplingParams(allowed_token_ids=[10000000]))
 
+    # Reject allowlists that min_tokens would fully mask.
+    with pytest.raises(ValueError):
+        SamplingParams(
+            max_tokens=2,
+            min_tokens=1,
+            allowed_token_ids=[10],
+            stop_token_ids=[10],
+            ignore_eos=True,
+        ).update_from_generation_config({})
+    with pytest.raises(ValueError):
+        SamplingParams(
+            max_tokens=2,
+            min_tokens=1,
+            allowed_token_ids=[2],
+        ).update_from_generation_config({}, eos_token_id=2)
+
+    SamplingParams(
+        max_tokens=2,
+        min_tokens=0,
+        allowed_token_ids=[10],
+        stop_token_ids=[10],
+        ignore_eos=True,
+    ).update_from_generation_config({})
+
 
 def test_seed(llm):
     """Check that seed impacts randomness."""

@@ -654,6 +654,8 @@ class SamplingParams(
                     eos_ids.update(self.stop_token_ids)
                     self.stop_token_ids = list(eos_ids)
 
+        self._validate_allowed_token_ids_min_tokens()
+
     def update_from_tokenizer(self, tokenizer: TokenizerLike) -> None:
         if not self.bad_words:
             return
@@ -744,6 +746,7 @@ class SamplingParams(
         self._validate_logit_bias(model_config)
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
+        self._validate_allowed_token_ids_min_tokens()
         self._validate_spec_decode(speculative_config)
         self._validate_diffusion(model_config)
         self._validate_structured_outputs(
@@ -864,6 +867,24 @@ class SamplingParams(
                     parameter="allowed_token_ids",
                     value=invalid_token_ids,
                 )
+
+    def _validate_allowed_token_ids_min_tokens(self) -> None:
+        if not self.allowed_token_ids or self.min_tokens <= 0:
+            return
+
+        all_stop_token_ids = self.all_stop_token_ids
+        if not all_stop_token_ids:
+            return
+
+        if set(self.allowed_token_ids).issubset(all_stop_token_ids):
+            raise VLLMValidationError(
+                "allowed_token_ids cannot contain only stop token ids when "
+                "min_tokens is greater than 0. min_tokens masks stop token "
+                "ids until the minimum output length is reached, leaving no "
+                "allowed token to sample.",
+                parameter="allowed_token_ids",
+                value=self.allowed_token_ids,
+            )
 
     def _validate_spec_decode(
         self,
