@@ -1050,16 +1050,6 @@ class OpenAIServingResponses(GenerateBaseServing):
                 delta=False,
             )
 
-        # Compute logprobs if requested
-        logprobs = None
-        if request.is_include_output_logprobs() and final_output.logprobs:
-            logprobs = self._create_response_logprobs(
-                token_ids=final_output.token_ids,
-                logprobs=final_output.logprobs,
-                tokenizer=tokenizer,
-                top_logprobs=request.top_logprobs,
-            )
-
         # Use parser to extract reasoning, content, and tool calls
         if parser:
             reasoning, content, tool_calls = parser.parse(
@@ -1067,6 +1057,27 @@ class OpenAIServingResponses(GenerateBaseServing):
                 request,
                 enable_auto_tools=self.enable_auto_tools,
                 model_output_token_ids=final_output.token_ids,
+            )
+            logprob_token_ids = final_output.token_ids
+            output_logprobs = final_output.logprobs
+            if output_logprobs:
+                logprob_token_ids, output_logprobs = (
+                    self._filter_logprobs_to_content_tokens(
+                        parser,
+                        logprob_token_ids,
+                        output_logprobs,
+                        has_content=bool(content),
+                    )
+                )
+            logprobs = (
+                self._create_response_logprobs(
+                    token_ids=logprob_token_ids,
+                    logprobs=output_logprobs,
+                    tokenizer=tokenizer,
+                    top_logprobs=request.top_logprobs,
+                )
+                if request.is_include_output_logprobs() and output_logprobs
+                else None
             )
             return build_response_output_items(
                 reasoning=reasoning,
@@ -1077,6 +1088,14 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
 
         # Fallback when no parser is configured
+        logprobs = None
+        if request.is_include_output_logprobs() and final_output.logprobs:
+            logprobs = self._create_response_logprobs(
+                token_ids=final_output.token_ids,
+                logprobs=final_output.logprobs,
+                tokenizer=tokenizer,
+                top_logprobs=request.top_logprobs,
+            )
         return [
             ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
@@ -1343,13 +1362,14 @@ class OpenAIServingResponses(GenerateBaseServing):
         processor = SimpleStreamingEventProcessor(tools=request.tools)
 
         def _get_logprobs(
-            output: CompletionOutput,
+            token_ids: Sequence[int],
+            output_logprobs: SampleLogprobs | None,
         ) -> list[response_text_delta_event.Logprob]:
-            if not request.is_include_output_logprobs():
+            if not request.is_include_output_logprobs() or not output_logprobs:
                 return []
             return self._create_stream_response_logprobs(
-                token_ids=output.token_ids,
-                logprobs=output.logprobs,
+                token_ids=token_ids,
+                logprobs=output_logprobs,
                 tokenizer=tokenizer,
                 top_logprobs=request.top_logprobs,
             )
@@ -1378,6 +1398,30 @@ class OpenAIServingResponses(GenerateBaseServing):
             if not delta_message:
                 continue
 
+            logprob_token_ids = output.token_ids
+            output_logprobs = output.logprobs
+            if request.is_include_output_logprobs():
+                assert output.logprobs is not None, "logprobs must be provided"
+            if ctx.response_parser and output_logprobs:
+                if delta_message.content:
+                    logprob_token_ids, output_logprobs = (
+                        self._filter_logprobs_to_content_tokens(
+                            ctx.response_parser,
+                            logprob_token_ids,
+                            output_logprobs,
+                            has_content=bool(delta_message.content),
+                        )
+                    )
+                else:
+                    logprob_token_ids, output_logprobs = [], []
+
+            def get_logprobs(
+                _output: CompletionOutput,
+                token_ids: Sequence[int] = logprob_token_ids,
+                logprobs: SampleLogprobs | None = output_logprobs,
+            ) -> list[response_text_delta_event.Logprob]:
+                return _get_logprobs(token_ids, logprobs)
+
             for dm in split_delta(delta_message):
                 target_state, tool_call = processor.resolve_target_state(dm)
                 if target_state == _StateType.NONE:
@@ -1389,7 +1433,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                     for event in processor.open(target_state, tool_call):
                         yield _increment_sequence_number_and_return(event)
 
-                for event in processor.emit_delta(dm, output, _get_logprobs):
+                for event in processor.emit_delta(dm, output, get_logprobs):
                     yield _increment_sequence_number_and_return(event)
 
         for event in processor.close_current():

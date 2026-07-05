@@ -50,6 +50,7 @@ from vllm.entrypoints.openai.responses.streaming_events import (
     StreamingState,
 )
 from vllm.inputs import tokens_input
+from vllm.logprobs import Logprob as SampleLogprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.harmony import Segment
 from vllm.sampling_params import SamplingParams
@@ -703,6 +704,146 @@ def _make_simple_context_with_output(text, token_ids, response_parser=None):
     )
     ctx.append_output(req_output)
     return ctx
+
+
+class DummyReasoningLogprobsParser:
+    def parse(self, text, request, enable_auto_tools=False, model_output_token_ids=()):
+        assert text == "<think>why</think>OK"
+        assert tuple(model_output_token_ids) == (10, 11, 12, 13)
+        return "why", "OK", None
+
+    def extract_content_ids(self, input_ids):
+        return list(input_ids[-1:])
+
+
+class DummyEmptyContentIdsReasoningParser(DummyReasoningLogprobsParser):
+    def extract_content_ids(self, input_ids):
+        return []
+
+
+class DummyReasoningTokenizer:
+    def decode(self, token_id):
+        return f"tok{token_id}"
+
+
+def make_reasoning_logprobs():
+    return [
+        {
+            token_id: SampleLogprob(
+                logprob=-0.1 * token_id,
+                rank=1,
+                decoded_token=f"tok{token_id}",
+            )
+        }
+        for token_id in (10, 11, 12, 13)
+    ]
+
+
+def make_reasoning_request_output(text, token_ids, logprobs):
+    completion = CompletionOutput(
+        index=0,
+        text=text,
+        token_ids=token_ids,
+        cumulative_logprob=None,
+        logprobs=logprobs,
+        finish_reason=None,
+    )
+    return RequestOutput(
+        request_id="reasoning-logprobs",
+        prompt="hi",
+        prompt_token_ids=[1],
+        prompt_logprobs=None,
+        outputs=[completion],
+        finished=False,
+        num_cached_tokens=0,
+    )
+
+
+def make_responses_serving_for_logprobs():
+    serving = object.__new__(OpenAIServingResponses)
+    serving.enable_log_outputs = False
+    serving.request_logger = None
+    serving.enable_auto_tools = False
+    serving.return_tokens_as_token_ids = True
+    return serving
+
+
+async def collect_reasoning_streaming_events(request, output, parser=None):
+    serving = make_responses_serving_for_logprobs()
+    ctx = SimpleContext(response_parser=parser)
+    ctx.append_output(output)
+
+    async def result_generator():
+        yield ctx
+
+    events = []
+    async for event in serving._process_simple_streaming_events(
+        request=request,
+        sampling_params=SamplingParams(max_tokens=4),
+        result_generator=result_generator(),
+        context=SimpleContext(response_parser=parser),
+        model_name="test-model",
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+        created_time=0,
+        _increment_sequence_number_and_return=lambda event: event,
+    ):
+        events.append(event)
+    return events
+
+
+@pytest.mark.parametrize(
+    ("parser", "expected_tokens"),
+    [
+        (DummyReasoningLogprobsParser(), ["token_id:13"]),
+        (
+            DummyEmptyContentIdsReasoningParser(),
+            ["token_id:10", "token_id:11", "token_id:12", "token_id:13"],
+        ),
+    ],
+)
+def test_responses_output_text_logprobs_filter_or_fallback(parser, expected_tokens):
+    serving = make_responses_serving_for_logprobs()
+    request = ResponsesRequest(
+        input="hi",
+        include=["message.output_text.logprobs"],
+        top_logprobs=0,
+        tools=[],
+    )
+    final_output = CompletionOutput(
+        index=0,
+        text="<think>why</think>OK",
+        token_ids=(10, 11, 12, 13),
+        cumulative_logprob=None,
+        logprobs=make_reasoning_logprobs(),
+        finish_reason="stop",
+    )
+
+    items = serving._make_response_output_items(
+        request,
+        final_output,
+        DummyReasoningTokenizer(),
+        parser=parser,
+    )
+
+    message = next(item for item in items if getattr(item, "type", None) == "message")
+    text_part = message.content[0]
+    assert text_part.text == "OK"
+    assert [lp.token for lp in text_part.logprobs] == expected_tokens
+
+
+@pytest.mark.asyncio
+async def test_simple_streaming_content_without_logprobs_does_not_crash():
+    request = ResponsesRequest(input="hi", stream=True)
+    output = make_reasoning_request_output("OK", (13,), None)
+
+    events = await collect_reasoning_streaming_events(request, output)
+
+    text_delta_events = [
+        event for event in events if event.type == "response.output_text.delta"
+    ]
+    assert [event.delta for event in text_delta_events] == ["OK"]
+    assert text_delta_events[0].logprobs == []
 
 
 def _make_serving_instance_with_reasoning():

@@ -251,29 +251,48 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             for output in final_res.outputs:
                 self._raise_if_error(output.finish_reason, request_id)
 
+                token_ids = output.token_ids
+                out_logprobs = output.logprobs
+                logprob_token_ids = token_ids
+
+                if parser is not None:
+                    reasoning, content, _ = parser.parse(
+                        output.text,
+                        request=request,  # type: ignore[arg-type]
+                        model_output_token_ids=token_ids,
+                    )
+                    should_filter_token_ids = (
+                        request.return_token_ids and not request.include_reasoning
+                    )
+                    if out_logprobs is not None or should_filter_token_ids:
+                        logprob_token_ids, out_logprobs = (
+                            self._filter_logprobs_to_content_tokens(
+                                parser,
+                                token_ids,
+                                out_logprobs,
+                                has_content=bool(content),
+                                has_hidden_reasoning=(
+                                    bool(reasoning) and not request.include_reasoning
+                                ),
+                            )
+                        )
+                    if not request.include_reasoning:
+                        reasoning = None
+                else:
+                    reasoning = None
+                    content = output.text
+
                 if request.logprobs and request.top_logprobs is not None:
-                    assert output.logprobs is not None, "Did not output logprobs"
+                    assert out_logprobs is not None, "Did not output logprobs"
                     logprobs = self._create_chat_logprobs(
-                        token_ids=output.token_ids,
-                        top_logprobs=output.logprobs,
+                        token_ids=logprob_token_ids,
+                        top_logprobs=out_logprobs,
                         num_output_top_logprobs=request.top_logprobs,
                         tokenizer=tokenizer,
                         return_as_token_id=request.return_tokens_as_token_ids,
                     )
                 else:
                     logprobs = None
-
-                if parser is not None:
-                    reasoning, content, _ = parser.parse(
-                        output.text,
-                        request=request,  # type: ignore[arg-type]
-                        model_output_token_ids=output.token_ids,
-                    )
-                    if not request.include_reasoning:
-                        reasoning = None
-                else:
-                    reasoning = None
-                    content = output.text
 
                 role = (
                     self.response_role
@@ -303,7 +322,13 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     else "stop",
                     stop_reason=output.stop_reason,
                     token_ids=(
-                        as_list(output.token_ids) if request.return_token_ids else None
+                        as_list(
+                            logprob_token_ids
+                            if parser is not None and not request.include_reasoning
+                            else output.token_ids
+                        )
+                        if request.return_token_ids
+                        else None
                     ),
                 )
                 choices.append(choice_data)

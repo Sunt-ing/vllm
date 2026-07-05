@@ -21,7 +21,11 @@ from tests.utils import RemoteOpenAIServer
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config import MultiModalConfig
 from vllm.entrypoints.generate.base.serving import build_per_request_timing_metrics
+from vllm.entrypoints.openai.chat_completion.batch_serving import (
+    OpenAIServingChatBatch,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
@@ -31,6 +35,7 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     _make_prompt_tokens_details,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaMessage,
     ErrorResponse,
     RequestResponseMetadata,
 )
@@ -42,9 +47,11 @@ from vllm.entrypoints.openai.models.serving import (
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
+from vllm.logprobs import Logprob as SampleLogprob
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
+from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -810,6 +817,501 @@ async def _async_serving_chat_init():
 def test_async_serving_chat_init():
     serving_completion = asyncio.run(_async_serving_chat_init())
     assert serving_completion.chat_template == CHAT_TEMPLATE
+
+
+class DummyReasoningLogprobsParser:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def parse(self, text, request, enable_auto_tools=False, model_output_token_ids=()):
+        assert text == "<think>why</think>OK"
+        assert tuple(model_output_token_ids) == (10, 11, 12, 13)
+        return "why", "OK", None
+
+    def parse_delta(
+        self,
+        delta_text,
+        delta_token_ids,
+        request,
+        prompt_token_ids=None,
+        finished=False,
+    ):
+        assert delta_text == "<think>why</think>OK"
+        assert tuple(delta_token_ids) == (10, 11, 12, 13)
+        return DeltaMessage(content="OK")
+
+    def extract_content_ids(self, input_ids):
+        return list(input_ids[-1:])
+
+
+class DummyEmptyContentIdsReasoningParser(DummyReasoningLogprobsParser):
+    def extract_content_ids(self, input_ids):
+        return []
+
+
+class DummyHiddenReasoningLogprobsParser(DummyEmptyContentIdsReasoningParser):
+    def parse(self, text, request, enable_auto_tools=False, model_output_token_ids=()):
+        assert text == "<think>why</think>"
+        assert tuple(model_output_token_ids) == (10, 11, 12)
+        return "why", None, None
+
+    def parse_delta(
+        self,
+        delta_text,
+        delta_token_ids,
+        request,
+        prompt_token_ids=None,
+        finished=False,
+    ):
+        assert delta_text == "<think>why</think>"
+        assert tuple(delta_token_ids) == (10, 11, 12)
+        return DeltaMessage(reasoning="why")
+
+
+class DummyUnalignedReasoningLogprobsParser:
+    def extract_content_ids(self, input_ids):
+        return [12]
+
+
+class DummyReasoningTokenizer:
+    def decode(self, token_id):
+        return f"tok{token_id}"
+
+
+class DummyGptOssTokenizer:
+    def __init__(self):
+        self.encoding = get_encoding()
+
+    def encode(self, text):
+        return self.encoding.encode(text, allowed_special="all")
+
+    def get_vocab(self):
+        return {"<|end|>": self.encode("<|end|>")[0]}
+
+    def decode(self, token_ids):
+        return "".join(f"tok{token_id}" for token_id in token_ids)
+
+
+def make_gptoss_harmony_parser():
+    reasoning_parser_cls = HarmonyParser.reasoning_parser_cls
+    tool_parser_cls = HarmonyParser.tool_parser_cls
+    try:
+        HarmonyParser.reasoning_parser_cls = GptOssReasoningParser
+        HarmonyParser.tool_parser_cls = None
+        return HarmonyParser(DummyGptOssTokenizer())
+    finally:
+        HarmonyParser.reasoning_parser_cls = reasoning_parser_cls
+        HarmonyParser.tool_parser_cls = tool_parser_cls
+
+
+def make_reasoning_logprobs(token_ids=(10, 11, 12, 13)):
+    return [
+        {
+            token_id: SampleLogprob(
+                logprob=-0.1 * token_id,
+                rank=1,
+                decoded_token=f"tok{token_id}",
+            )
+        }
+        for token_id in token_ids
+    ]
+
+
+def make_reasoning_chat_request_output(text, token_ids, logprobs, *, finished=True):
+    completion = CompletionOutput(
+        index=0,
+        text=text,
+        token_ids=token_ids,
+        cumulative_logprob=0.0,
+        logprobs=logprobs,
+        finish_reason="stop" if finished else None,
+    )
+    return RequestOutput(
+        request_id="reasoning-logprobs",
+        prompt="hi",
+        prompt_token_ids=[1],
+        prompt_logprobs=None,
+        outputs=[completion],
+        finished=finished,
+        num_cached_tokens=0,
+    )
+
+
+def make_chat_serving_for_logprobs(serving_cls=OpenAIServingChat):
+    serving = object.__new__(serving_cls)
+    serving.response_role = "assistant"
+    serving.enable_auto_tools = False
+    serving.parser_cls = None
+    serving.return_tokens_as_token_ids = True
+    serving.enable_log_outputs = False
+    serving.enable_log_deltas = False
+    serving.request_logger = None
+    serving.system_fingerprint = None
+    serving.enable_prompt_tokens_details = False
+    serving.enable_force_include_usage = False
+    serving.enable_per_request_metrics = False
+    serving.model_config = None
+    return serving
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parser", "expected_tokens"),
+    [
+        (DummyReasoningLogprobsParser(), ["token_id:13"]),
+        (
+            DummyEmptyContentIdsReasoningParser(),
+            ["token_id:10", "token_id:11", "token_id:12", "token_id:13"],
+        ),
+    ],
+)
+async def test_chat_logprobs_filter_or_fallback(parser, expected_tokens):
+    serving = make_chat_serving_for_logprobs()
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        logprobs=True,
+        top_logprobs=0,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator():
+        yield make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            make_reasoning_logprobs(),
+        )
+
+    response = await serving.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="reasoning-logprobs",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+        parser=parser,
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    choice = response.choices[0]
+    assert choice.message.content == "OK"
+    assert [lp.token for lp in choice.logprobs.content] == expected_tokens
+
+
+@pytest.mark.asyncio
+async def test_chat_logprobs_empty_when_parser_has_no_visible_content():
+    serving = make_chat_serving_for_logprobs()
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        include_reasoning=False,
+        logprobs=True,
+        top_logprobs=0,
+        return_token_ids=True,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator():
+        yield make_reasoning_chat_request_output(
+            "<think>why</think>",
+            (10, 11, 12),
+            make_reasoning_logprobs((10, 11, 12)),
+        )
+
+    response = await serving.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="reasoning-logprobs",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+        parser=DummyHiddenReasoningLogprobsParser(),
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    choice = response.choices[0]
+    assert choice.message.content is None
+    assert choice.message.reasoning is None
+    assert choice.logprobs is not None
+    assert choice.logprobs.content == []
+    assert choice.token_ids == []
+
+
+@pytest.mark.asyncio
+async def test_chat_logprobs_empty_when_hidden_reasoning_ids_unavailable():
+    serving = make_chat_serving_for_logprobs()
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        include_reasoning=False,
+        logprobs=True,
+        top_logprobs=0,
+        return_token_ids=True,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator():
+        yield make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            make_reasoning_logprobs(),
+        )
+
+    response = await serving.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="reasoning-logprobs",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+        parser=DummyEmptyContentIdsReasoningParser(),
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    choice = response.choices[0]
+    assert choice.message.content == "OK"
+    assert choice.message.reasoning is None
+    assert choice.logprobs is not None
+    assert choice.logprobs.content == []
+    assert choice.token_ids == []
+
+
+@pytest.mark.asyncio
+async def test_chat_token_ids_empty_when_hidden_reasoning_without_logprobs():
+    serving = make_chat_serving_for_logprobs()
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        include_reasoning=False,
+        return_token_ids=True,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator():
+        yield make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            None,
+        )
+
+    response = await serving.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="reasoning-token-ids",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-token-ids"),
+        parser=DummyEmptyContentIdsReasoningParser(),
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    choice = response.choices[0]
+    assert choice.message.content == "OK"
+    assert choice.message.reasoning is None
+    assert choice.logprobs is None
+    assert choice.token_ids == []
+
+
+@pytest.mark.asyncio
+async def test_batch_chat_logprobs_empty_when_hidden_reasoning_ids_unavailable():
+    serving = make_chat_serving_for_logprobs(OpenAIServingChatBatch)
+    request = BatchChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[
+            [{"role": "user", "content": "first"}],
+            [{"role": "user", "content": "second"}],
+        ],
+        include_reasoning=False,
+        logprobs=True,
+        top_logprobs=0,
+        return_token_ids=True,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator(output):
+        yield output
+
+    outputs = [
+        make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            make_reasoning_logprobs(),
+        ),
+        make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            make_reasoning_logprobs(),
+        ),
+    ]
+    response = await serving.chat_completion_full_generator_batch(
+        request=request,
+        generators=[result_generator(output) for output in outputs],
+        request_id="reasoning-logprobs",
+        model_name=MODEL_NAME,
+        all_conversations=[[], []],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+        parser=DummyEmptyContentIdsReasoningParser(),
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    assert len(response.choices) == 2
+    for index, choice in enumerate(response.choices):
+        assert choice.index == index
+        assert choice.message.content == "OK"
+        assert choice.message.reasoning is None
+        assert choice.logprobs is not None
+        assert choice.logprobs.content == []
+        assert choice.token_ids == []
+
+
+@pytest.mark.asyncio
+async def test_batch_chat_token_ids_empty_when_hidden_reasoning_without_logprobs():
+    serving = make_chat_serving_for_logprobs(OpenAIServingChatBatch)
+    request = BatchChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[
+            [{"role": "user", "content": "first"}],
+            [{"role": "user", "content": "second"}],
+        ],
+        include_reasoning=False,
+        return_token_ids=True,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator(output):
+        yield output
+
+    outputs = [
+        make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            None,
+        ),
+        make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            None,
+        ),
+    ]
+    response = await serving.chat_completion_full_generator_batch(
+        request=request,
+        generators=[result_generator(output) for output in outputs],
+        request_id="reasoning-token-ids",
+        model_name=MODEL_NAME,
+        all_conversations=[[], []],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-token-ids"),
+        parser=DummyEmptyContentIdsReasoningParser(),
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    assert len(response.choices) == 2
+    for index, choice in enumerate(response.choices):
+        assert choice.index == index
+        assert choice.message.content == "OK"
+        assert choice.message.reasoning is None
+        assert choice.logprobs is None
+        assert choice.token_ids == []
+
+
+@pytest.mark.asyncio
+async def test_chat_streaming_logprobs_filter_content_delta():
+    serving = make_chat_serving_for_logprobs()
+    serving.parser_cls = DummyReasoningLogprobsParser
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        logprobs=True,
+        top_logprobs=0,
+        return_tokens_as_token_ids=True,
+    )
+
+    async def result_generator():
+        yield make_reasoning_chat_request_output(
+            "<think>why</think>OK",
+            (10, 11, 12, 13),
+            make_reasoning_logprobs(),
+        )
+
+    content_logprobs = None
+    async for chunk in serving.chat_completion_stream_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="reasoning-logprobs",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=DummyReasoningTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+    ):
+        if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+            continue
+        data = json.loads(chunk.removeprefix("data: "))
+        choice = data["choices"][0]
+        if choice["delta"].get("content") == "OK":
+            content_logprobs = choice["logprobs"]["content"]
+            break
+
+    assert content_logprobs is not None
+    assert [lp["token"] for lp in content_logprobs] == ["token_id:13"]
+
+
+def test_filter_logprobs_keeps_original_tokens_when_content_ids_do_not_align():
+    serving = object.__new__(OpenAIServingChat)
+    original_logprobs = make_reasoning_logprobs()
+    token_ids, logprobs = serving._filter_logprobs_to_content_tokens(
+        DummyUnalignedReasoningLogprobsParser(),
+        (10, 11, 12, 13),
+        original_logprobs,
+        has_content=True,
+    )
+
+    assert token_ids == (10, 11, 12, 13)
+    assert logprobs is original_logprobs
+
+
+@pytest.mark.asyncio
+async def test_chat_logprobs_fallback_for_harmony_parser_without_content_ids():
+    serving = make_chat_serving_for_logprobs()
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+        logprobs=True,
+        top_logprobs=0,
+        return_tokens_as_token_ids=True,
+    )
+    content = "The answer is 2."
+    response_text = f"<|start|>assistant<|channel|>final<|message|>{content}<|end|>"
+    harmony_token_ids = get_encoding().encode(response_text, allowed_special="all")
+
+    async def result_generator():
+        yield make_reasoning_chat_request_output(
+            "",
+            harmony_token_ids,
+            make_reasoning_logprobs(harmony_token_ids),
+        )
+
+    response = await serving.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="reasoning-logprobs",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=DummyGptOssTokenizer(),
+        request_metadata=RequestResponseMetadata(request_id="reasoning-logprobs"),
+        parser=make_gptoss_harmony_parser(),
+    )
+
+    assert not isinstance(response, ErrorResponse)
+    choice = response.choices[0]
+    assert choice.message.content == content
+    assert choice.logprobs is not None
+    assert len(choice.logprobs.content) == len(harmony_token_ids)
 
 
 def test_mm_prompt_tokens_details():

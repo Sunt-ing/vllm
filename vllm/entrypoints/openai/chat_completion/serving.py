@@ -568,18 +568,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     if finish_reason_sent[i]:
                         continue
 
-                    if request.logprobs and request.top_logprobs is not None:
-                        assert output.logprobs is not None, "Did not output logprobs"
-                        logprobs = self._create_chat_logprobs(
-                            token_ids=output.token_ids,
-                            top_logprobs=output.logprobs,
-                            tokenizer=tokenizer,
-                            num_output_top_logprobs=request.top_logprobs,
-                            return_as_token_id=request.return_tokens_as_token_ids,
-                        )
-                    else:
-                        logprobs = None
-
+                    out_logprobs = output.logprobs
+                    logprob_token_ids = output.token_ids
+                    should_emit_logprobs = out_logprobs is not None
+                    hidden_reasoning_delta = False
                     delta_text = output.text
 
                     if (
@@ -608,15 +600,52 @@ class OpenAIServingChat(GenerateBaseServing):
                                 delta_message.reasoning
                                 and not request.include_reasoning
                             ):
+                                hidden_reasoning_delta = True
                                 delta_message.reasoning = None
                                 if not (
                                     delta_message.content or delta_message.tool_calls
                                 ):
                                     delta_message = None
 
+                        if out_logprobs is not None and delta_message is not None:
+                            if delta_message.content:
+                                logprob_token_ids, out_logprobs = (
+                                    self._filter_logprobs_to_content_tokens(
+                                        parser,
+                                        output.token_ids,
+                                        out_logprobs,
+                                        has_content=bool(delta_message.content),
+                                        has_hidden_reasoning=hidden_reasoning_delta,
+                                    )
+                                )
+                            else:
+                                logprob_token_ids, out_logprobs = [], []
+                                should_emit_logprobs = False
+                        elif hidden_reasoning_delta:
+                            logprob_token_ids, out_logprobs = [], []
+                            should_emit_logprobs = False
+
                     # handle streaming just a content delta (no parsers)
                     else:
                         delta_message = DeltaMessage(content=delta_text)
+
+                    if request.logprobs and request.top_logprobs is not None:
+                        assert output.logprobs is not None, "Did not output logprobs"
+
+                    if (
+                        request.logprobs
+                        and request.top_logprobs is not None
+                        and should_emit_logprobs
+                    ):
+                        logprobs = self._create_chat_logprobs(
+                            token_ids=logprob_token_ids,
+                            top_logprobs=out_logprobs,
+                            tokenizer=tokenizer,
+                            num_output_top_logprobs=request.top_logprobs,
+                            return_as_token_id=request.return_tokens_as_token_ids,
+                        )
+                    else:
+                        logprobs = None
 
                     previous_texts[i] += delta_text
 
@@ -628,6 +657,8 @@ class OpenAIServingChat(GenerateBaseServing):
                     # wasn't ready to send a token, then
                     #   get the next token without streaming a chunk
                     if delta_message is None:
+                        if hidden_reasoning_delta and output.finish_reason is None:
+                            continue
                         # NOTE: If return_token_ids is enabled, we still need to
                         # send a chunk with token_ids even if delta_message is None
                         # to ensure all tokens are included in the response
@@ -674,7 +705,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             logprobs=logprobs,
                             finish_reason=None,
                             token_ids=(
-                                as_list(output.token_ids)
+                                as_list(logprob_token_ids)
                                 if request.return_token_ids
                                 else None
                             ),
@@ -704,7 +735,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             finish_reason=finish_reason_,
                             stop_reason=output.stop_reason,
                             token_ids=(
-                                as_list(output.token_ids)
+                                as_list(logprob_token_ids)
                                 if request.return_token_ids
                                 else None
                             ),
@@ -864,17 +895,7 @@ class OpenAIServingChat(GenerateBaseServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
 
-            if request.logprobs and request.top_logprobs is not None:
-                assert out_logprobs is not None, "Did not output logprobs"
-                logprobs = self._create_chat_logprobs(
-                    token_ids=token_ids,
-                    top_logprobs=out_logprobs,
-                    num_output_top_logprobs=request.top_logprobs,
-                    tokenizer=tokenizer,
-                    return_as_token_id=request.return_tokens_as_token_ids,
-                )
-            else:
-                logprobs = None
+            logprob_token_ids = token_ids
 
             if parser is not None:
                 reasoning, content, tool_calls = parser.parse(
@@ -883,12 +904,39 @@ class OpenAIServingChat(GenerateBaseServing):
                     enable_auto_tools=self.enable_auto_tools,
                     model_output_token_ids=token_ids,
                 )
+                should_filter_token_ids = (
+                    request.return_token_ids and not request.include_reasoning
+                )
+                if out_logprobs is not None or should_filter_token_ids:
+                    logprob_token_ids, out_logprobs = (
+                        self._filter_logprobs_to_content_tokens(
+                            parser,
+                            token_ids,
+                            out_logprobs,
+                            has_content=bool(content),
+                            has_hidden_reasoning=(
+                                bool(reasoning) and not request.include_reasoning
+                            ),
+                        )
+                    )
                 if not request.include_reasoning:
                     reasoning = None
             else:
                 reasoning = None
                 content = output.text
                 tool_calls = []
+
+            if request.logprobs and request.top_logprobs is not None:
+                assert out_logprobs is not None, "Did not output logprobs"
+                logprobs = self._create_chat_logprobs(
+                    token_ids=logprob_token_ids,
+                    top_logprobs=out_logprobs,
+                    num_output_top_logprobs=request.top_logprobs,
+                    tokenizer=tokenizer,
+                    return_as_token_id=request.return_tokens_as_token_ids,
+                )
+            else:
+                logprobs = None
 
             auto_tools_called = False
             is_named_tool_choice = (
@@ -982,7 +1030,13 @@ class OpenAIServingChat(GenerateBaseServing):
                 else "stop",
                 stop_reason=output.stop_reason,
                 token_ids=(
-                    as_list(output.token_ids) if request.return_token_ids else None
+                    as_list(
+                        logprob_token_ids
+                        if parser is not None and not request.include_reasoning
+                        else output.token_ids
+                    )
+                    if request.return_token_ids
+                    else None
                 ),
                 routed_experts=routed_experts_b64,
             )

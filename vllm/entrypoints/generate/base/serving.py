@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import time
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import ClassVar, Generic, TypeVar
+from typing import ClassVar, Generic, Protocol, TypeVar
 
 from fastapi import Request
 from pydantic import ConfigDict
@@ -96,6 +96,10 @@ def build_per_request_timing_metrics(
         mean_itl_ms=mean_itl_ms,
         tokens_per_second=tokens_per_second,
     )
+
+
+class _ContentTokenExtractor(Protocol):
+    def extract_content_ids(self, input_ids: list[int]) -> list[int]: ...
 
 
 @dataclass(kw_only=True)
@@ -268,6 +272,39 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             )
 
         return tokenizer.decode([token_id])
+
+    @staticmethod
+    def _filter_logprobs_to_content_tokens(
+        parser: _ContentTokenExtractor,
+        token_ids: Sequence[int],
+        logprobs: Sequence[_T] | None,
+        *,
+        has_content: bool,
+        has_hidden_reasoning: bool = False,
+    ) -> tuple[Sequence[int], Sequence[_T] | None]:
+        empty_logprobs = [] if logprobs is not None else None
+        if not has_content:
+            return [], empty_logprobs
+        try:
+            content_token_ids = parser.extract_content_ids(list(token_ids))
+        except NotImplementedError:
+            if has_hidden_reasoning:
+                return [], empty_logprobs
+            return token_ids, logprobs
+        if len(content_token_ids) == len(token_ids):
+            return token_ids, logprobs
+        if not content_token_ids:
+            if has_hidden_reasoning:
+                return [], empty_logprobs
+            return token_ids, logprobs
+
+        content_len = len(content_token_ids)
+        if list(token_ids[-content_len:]) == content_token_ids:
+            content_logprobs = logprobs[-content_len:] if logprobs is not None else None
+            return content_token_ids, content_logprobs
+        if has_hidden_reasoning:
+            return [], empty_logprobs
+        return token_ids, logprobs
 
 
 def format_token_id_placeholder(token_id: int) -> str:
