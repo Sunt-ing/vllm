@@ -10,6 +10,7 @@ import pytest
 from vllm.config import ModelConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.processing.context import InputProcessingContext
+from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.multimodal.processing.processor import (
     PlaceholderFeaturesInfo,
     PromptIndexTargets,
@@ -1092,3 +1093,25 @@ def test_apply_matches_no_match_exits_quickly():
     # Should complete in < 100ms (was taking seconds before the fix)
     assert elapsed < 0.1, f"_apply_matches took {elapsed:.2f}s, expected < 0.1s"
     assert "".join(result) == long_prompt
+
+
+class _ItemsForHash:
+    def __init__(self, items: list[object]) -> None:
+        self.items = items
+
+    def get_all_items_for_hash(self) -> list[object]:
+        return self.items
+
+
+def test_get_mm_hashes_scopes_shared_uuid_by_modality():
+    inputs = ProcessorInputs(
+        prompt="",
+        mm_data_items={
+            "image": _ItemsForHash(["image-content"]),
+            "video": _ItemsForHash(["video-content"]),
+        },
+        mm_uuid_items={"image": ["shared-id"], "video": ["shared-id"]},
+    )
+    hashes = inputs.get_mm_hashes("test-model")
+
+    assert hashes["image"][0] != hashes["video"][0]

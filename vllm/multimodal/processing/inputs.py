@@ -34,28 +34,19 @@ class ProcessorInputs:
             if modality in mm_uuid_items:
                 uuid_items = mm_uuid_items[modality]
 
-                # For None entries, compute a hash; otherwise, use provided ID.
+                # Scope UUIDs by model and modality like content-derived hashes.
                 hashes: list[str] = []
                 for i, item in enumerate(data_items.get_all_items_for_hash()):
                     uuid_item = uuid_items[i]
 
-                    # NOTE: Even if a uuid_item is provided, we still compute a hash
-                    # if `hf_processor_mm_kwargs` is provided.
-                    # This is because the processed multimodal inputs can be different
-                    # depending on the processor kwargs.
-                    if uuid_item is None or hf_processor_mm_kwargs:
-                        # NOTE: use provided hash string to hash with kwargs
-                        # if available for better performance.
-                        item = uuid_item if uuid_item is not None else item
-                        hashes.append(
-                            hasher.hash_kwargs(
-                                model_id=model_id,
-                                **{modality: item},
-                                **hf_processor_mm_kwargs,
-                            )
+                    item = uuid_item if uuid_item is not None else item
+                    hashes.append(
+                        hasher.hash_kwargs(
+                            model_id=model_id,
+                            **{modality: item},
+                            **hf_processor_mm_kwargs,
                         )
-                    else:
-                        hashes.append(uuid_item)
+                    )
 
                 mm_hashes[modality] = hashes
             else:
