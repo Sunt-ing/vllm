@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
@@ -406,6 +406,23 @@ class TokenizeParams:
 
         return tokens + [tokenizer.pad_token_id] * (pad_length - len(tokens))
 
+    def _assistant_mask_padding(self, mask: list[int]) -> list[int]:
+        """Apply token padding semantics to an assistant-token mask."""
+        pad_length = self.pad_prompt_tokens
+        if pad_length is not None and pad_length < 0:
+            pad_length = self.max_input_tokens
+
+        if pad_length is None or pad_length <= len(mask):
+            return mask
+
+        return mask + [0] * (pad_length - len(mask))
+
+    def _validate_assistant_tokens_mask(
+        self, tokenizer: TokenizerLike | None, mask: list[int]
+    ) -> list[int]:
+        mask = self._assistant_mask_padding(mask)
+        return self._token_truncation(tokenizer, mask)
+
     def _token_truncation(self, tokenizer: TokenizerLike | None, tokens: _S) -> _S:
         """Apply truncation to prompt tokens if necessary."""
         max_length = self.truncate_prompt_tokens
@@ -479,6 +496,14 @@ class TokenizeParams:
                 tokenizer,
                 prompt["prompt_token_ids"],  # type: ignore[typeddict-item]
             )
+            prompt_dict = cast(dict[str, Any], prompt)
+            assistant_tokens_mask = prompt_dict.get("_assistant_tokens_mask")
+            if assistant_tokens_mask is not None:
+                prompt_dict["_assistant_tokens_mask"] = (
+                    self._validate_assistant_tokens_mask(
+                        tokenizer, assistant_tokens_mask
+                    )
+                )
         if "prompt_embeds" in prompt:
             prompt["prompt_embeds"] = self._validate_tokens(  # type: ignore[typeddict-unknown-key]
                 tokenizer,
