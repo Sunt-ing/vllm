@@ -2681,6 +2681,12 @@ async def test_tool_choice_validation_without_parser():
     assert "tool_choice" in response_required.error.message
     assert "--tool-call-parser" in response_required.error.message
 
+    rendered = await serving_chat.render_chat_request(
+        req_required, validate_tool_parser=False
+    )
+    assert not isinstance(rendered, ErrorResponse)
+    assert rendered[1][0]["prompt_token_ids"]
+
     # Test named tool_choice without tool_parser
     req_named = ChatCompletionRequest(
         model=MODEL_NAME,
