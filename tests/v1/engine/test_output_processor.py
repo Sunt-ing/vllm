@@ -1547,7 +1547,7 @@ async def test_cumulative_output_collector_n():
 
 
 @pytest.mark.parametrize("runner", ["generate", "pooling"])
-@pytest.mark.parametrize("abort_by", ["internal", "external"])
+@pytest.mark.parametrize("abort_by", ["internal", "external", "engine"])
 def test_abort_requests(runner: str, abort_by: str, dummy_test_vectors):
     output_processor = OutputProcessor(dummy_test_vectors.tokenizer, log_stats=True)
     requests = [
@@ -1577,10 +1577,20 @@ def test_abort_requests(runner: str, abort_by: str, dummy_test_vectors):
         output_processor.add_request(request, None, queue=queue)
 
     for request in requests:
-        if abort_by == "internal":
+        if abort_by == "engine":
+            output_processor.process_outputs(
+                [
+                    EngineCoreOutput(
+                        request.request_id, [], finish_reason=FinishReason.ABORT
+                    )
+                ]
+            )
+        elif abort_by == "internal":
             output_processor.abort_requests([request.request_id], internal=True)
         else:
             output_processor.abort_requests([request.external_req_id], internal=False)
+
+    assert not output_processor.has_unfinished_requests()
 
 
 @pytest.mark.parametrize("output_kind", list(RequestOutputKind))

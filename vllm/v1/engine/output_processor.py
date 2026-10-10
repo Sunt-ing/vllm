@@ -733,6 +733,13 @@ class OutputProcessor:
                 )
                 pooling_output = EMPTY_CPU_TENSOR
 
+            if (
+                pooling_output is None
+                and req_state.detokenizer is None
+                and finish_reason == FinishReason.ABORT
+            ):
+                pooling_output = EMPTY_CPU_TENSOR
+
             if pooling_output is None:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
