@@ -201,6 +201,13 @@ class OnlineDerenderer:
                     message=message,
                     logprobs=resolved_logprobs,
                     finish_reason=choice.finish_reason,
+                    token_ids=(
+                        choice.token_ids
+                        if chat_request is not None
+                        and chat_request.return_token_ids
+                        and (not has_parser or chat_request.include_reasoning)
+                        else None
+                    ),
                 )
             )
 
@@ -477,6 +484,11 @@ class OnlineDerenderer:
                     delta=delta,
                     logprobs=resolved_logprobs,
                     finish_reason=choice.finish_reason,
+                    token_ids=(
+                        choice.token_ids
+                        if chat_request is not None and chat_request.return_token_ids
+                        else None
+                    ),
                 )
             )
 
@@ -660,6 +672,11 @@ class OnlineDerenderer:
                 index=choice.index,
                 delta=delta_message,
                 finish_reason=finish_reason,
+                token_ids=(
+                    choice.token_ids
+                    if chat_request.return_token_ids and chat_request.include_reasoning
+                    else None
+                ),
             )
             stream_choices.append(
                 maybe_filter_parallel_tool_calls(stream_choice, chat_request)
